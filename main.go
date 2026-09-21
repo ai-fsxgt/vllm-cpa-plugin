@@ -197,6 +197,7 @@ func normalizeToolChoice(body []byte) ([]byte, error) {
 		delete(root, "tools")
 	}
 	delete(root, "tool_choice")
+	delete(root, "parallel_tool_calls")
 	return marshalRequest(root)
 }
 
@@ -306,6 +307,11 @@ func normalizeReasoningField(container map[string]any) bool {
 	}
 	reasoning, exists := container["reasoning"]
 	if !exists || isEmptyReasoning(reasoning) {
+		return false
+	}
+	switch reasoning.(type) {
+	case string, []any, map[string]any:
+	default:
 		return false
 	}
 	container["reasoning_content"] = reasoning
