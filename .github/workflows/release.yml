@@ -36,7 +36,7 @@ jobs:
           go build \
             -trimpath \
             -buildmode=c-shared \
-            -o dist/vllm-reasoning-normalizer-linux-amd64.so \
+            -o dist/vllm-reasoning-normalizer.so \
             .
 
       - name: Publish GitHub Release
@@ -44,7 +44,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            dist/vllm-reasoning-normalizer-linux-amd64.so \
+            dist/vllm-reasoning-normalizer.so \
             --verify-tag \
             --generate-notes \
             --title "$GITHUB_REF_NAME"
