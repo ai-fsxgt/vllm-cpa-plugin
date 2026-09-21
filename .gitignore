@@ -1,0 +1,15 @@
+.idea
+.vscode
+upload
+*.exe
+*.db
+build
+*.db-journal
+logs
+web/dist
+.env
+one-api
+.DS_Store
+analysis/perf_metrics/reports
+performance_analysis_*.md
+*.so
