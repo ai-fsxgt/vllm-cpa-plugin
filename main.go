@@ -122,7 +122,7 @@ func cliproxyPluginShutdown() {}
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
-		return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"vLLM reasoning normalizer","Version":"1.0.0","Author":"local","GitHubRepository":"https://github.com/router-for-me/CLIProxyAPI","ConfigFields":[]},"capabilities":{"request_normalizer":true,"response_before_translator":true,"response_after_translator":true}}`)
+		return okEnvelopeJSON(`{"schema_version":1,"metadata":{"Name":"vLLM reasoning normalizer","Version":"1.1.0","Author":"local","GitHubRepository":"https://github.com/router-for-me/CLIProxyAPI","ConfigFields":[]},"capabilities":{"request_normalizer":true,"response_before_translator":true,"response_after_translator":true}}`)
 	case "request.normalize":
 		return normalizeRequest(request)
 	case "response.normalize_before":
@@ -218,7 +218,9 @@ func normalizeResponseBefore(raw []byte) ([]byte, error) {
 		return okEnvelope(payloadResponse{Body: request.Body})
 	}
 
-	body, errNormalize := normalizeBody(request.Body)
+	body, errNormalize := normalizeBody(request.Body, func(raw []byte) ([]byte, bool, error) {
+		return normalizeJSON(raw, request.Stream)
+	})
 	if errNormalize != nil {
 		return nil, errNormalize
 	}
@@ -230,25 +232,31 @@ func normalizeResponseAfter(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode response transform request: %w", errUnmarshal)
 	}
-	if request.FromFormat != "openai" || request.ToFormat != "claude" || request.Stream {
+	if request.FromFormat != "openai" || request.ToFormat != "claude" {
 		return okEnvelope(payloadResponse{Body: request.Body})
 	}
 
-	body, errNormalize := orderClaudeThinkingFirst(request.Body)
+	body, errNormalize := normalizeBody(request.Body, func(raw []byte) ([]byte, bool, error) {
+		return normalizeClaudeJSON(raw, request.Stream)
+	})
 	if errNormalize != nil {
 		return nil, errNormalize
 	}
 	return okEnvelope(payloadResponse{Body: body})
 }
 
-func normalizeBody(body []byte) ([]byte, error) {
+func normalizeBody(body []byte, normalize func([]byte) ([]byte, bool, error)) ([]byte, error) {
 	trimmed := bytes.TrimSpace(body)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if bytes.HasPrefix(trimmed, []byte("data:")) || bytes.HasPrefix(trimmed, []byte("event:")) {
+		dataStart := bytes.Index(body, []byte("data:"))
+		if dataStart < 0 {
+			return nil, fmt.Errorf("locate streaming data field")
+		}
+		payload := bytes.TrimSpace(body[dataStart+len("data:"):])
 		if bytes.Equal(payload, []byte("[DONE]")) {
 			return body, nil
 		}
-		normalized, changed, errNormalize := normalizeJSON(payload)
+		normalized, changed, errNormalize := normalize(payload)
 		if errNormalize != nil || !changed {
 			return body, errNormalize
 		}
@@ -264,14 +272,14 @@ func normalizeBody(body []byte) ([]byte, error) {
 		return out, nil
 	}
 
-	normalized, changed, errNormalize := normalizeJSON(trimmed)
+	normalized, changed, errNormalize := normalize(trimmed)
 	if errNormalize != nil || !changed {
 		return body, errNormalize
 	}
 	return normalized, nil
 }
 
-func normalizeJSON(raw []byte) ([]byte, bool, error) {
+func normalizeJSON(raw []byte, stream bool) ([]byte, bool, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var root map[string]any
@@ -289,6 +297,17 @@ func normalizeJSON(raw []byte) ([]byte, bool, error) {
 				changed = true
 			}
 		}
+	}
+	usage, _ := root["usage"].(map[string]any)
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	if stream && len(choices) > 0 && usage != nil && details == nil {
+		// Defer CPA's final usage event until the trailing usage-only chunk.
+		delete(root, "usage")
+		changed = true
+	} else if createdTokens, exists := details["created_cache_tokens"]; exists {
+		details["cache_write_tokens"] = createdTokens
+		delete(details, "created_cache_tokens")
+		changed = true
 	}
 	if !changed {
 		return raw, false, nil
@@ -318,42 +337,68 @@ func normalizeReasoningField(container map[string]any) bool {
 	return true
 }
 
-func orderClaudeThinkingFirst(body []byte) ([]byte, error) {
+func normalizeClaudeJSON(body []byte, stream bool) ([]byte, bool, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	var root map[string]any
 	if errDecode := decoder.Decode(&root); errDecode != nil {
-		return nil, fmt.Errorf("decode Claude response: %w", errDecode)
+		return nil, false, fmt.Errorf("decode Claude response: %w", errDecode)
 	}
 
-	content, _ := root["content"].([]any)
-	thinking := make([]any, 0, len(content))
-	other := make([]any, 0, len(content))
-	seenOther := false
-	needsReorder := false
-	for _, rawBlock := range content {
-		block, _ := rawBlock.(map[string]any)
-		blockType, _ := block["type"].(string)
-		if blockType == "thinking" || blockType == "redacted_thinking" {
-			thinking = append(thinking, rawBlock)
-			if seenOther {
-				needsReorder = true
-			}
-			continue
+	changed := false
+	if stream {
+		if root["type"] == "content_block_start" {
+			block, _ := root["content_block"].(map[string]any)
+			changed = ensureThinkingSignature(block)
 		}
-		seenOther = true
-		other = append(other, rawBlock)
-	}
-	if !needsReorder {
-		return body, nil
+	} else {
+		content, _ := root["content"].([]any)
+		thinking := make([]any, 0, len(content))
+		other := make([]any, 0, len(content))
+		seenOther := false
+		needsReorder := false
+		for _, rawBlock := range content {
+			block, _ := rawBlock.(map[string]any)
+			if ensureThinkingSignature(block) {
+				changed = true
+			}
+			blockType, _ := block["type"].(string)
+			if blockType == "thinking" || blockType == "redacted_thinking" {
+				thinking = append(thinking, rawBlock)
+				if seenOther {
+					needsReorder = true
+				}
+				continue
+			}
+			seenOther = true
+			other = append(other, rawBlock)
+		}
+		if needsReorder {
+			root["content"] = append(thinking, other...)
+			changed = true
+		}
 	}
 
-	root["content"] = append(thinking, other...)
+	if !changed {
+		return body, false, nil
+	}
 	out, errMarshal := json.Marshal(root)
 	if errMarshal != nil {
-		return nil, fmt.Errorf("encode ordered Claude response: %w", errMarshal)
+		return nil, false, fmt.Errorf("encode normalized Claude response: %w", errMarshal)
 	}
-	return out, nil
+	return out, true, nil
+}
+
+func ensureThinkingSignature(block map[string]any) bool {
+	if block["type"] != "thinking" {
+		return false
+	}
+	if _, exists := block["signature"]; exists {
+		return false
+	}
+	// OpenAI reasoning is unsigned; an empty signature preserves the Claude schema.
+	block["signature"] = ""
+	return true
 }
 
 func isEmptyReasoning(value any) bool {
